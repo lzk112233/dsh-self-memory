@@ -1,0 +1,8 @@
+- insert:
+    - id: dsh-self-memory
+      name: 'dsh-self-memory'
+      config:
+        # 开机自动从 GitHub 拉一次并合并（没网时只在 .sync/notice.json 留痕，下次对话提一句）
+        pullOnStart: true
+        # 开着 DSH 期间每 30 分钟静默推一次；0 = 只在手动调用 self_memory_sync 时推
+        syncIntervalMinutes: 30

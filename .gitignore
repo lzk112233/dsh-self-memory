@@ -1,0 +1,11 @@
+node_modules/
+*.tgz
+*.log
+
+# 真实数据与密钥绝不进仓库
+.sync/
+master.key
+*.key
+*.jsonl
+env.json
+archive.json

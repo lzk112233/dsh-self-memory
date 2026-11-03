@@ -1,0 +1,67 @@
+{
+  "name": "dsh-self-memory",
+  "version": "1.3.1",
+  "description": "四层记忆 + 自我认知 + 归档联动 + 环境清单同步 for DSH：增量加密同步，换机器后记忆和插件环境一起长回来",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "author": "lzk112233",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lzk112233/dsh-self-memory.git"
+  },
+  "homepage": "https://github.com/lzk112233/dsh-self-memory#readme",
+  "bugs": {
+    "url": "https://github.com/lzk112233/dsh-self-memory/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "harness",
+    "memory",
+    "long-term-memory",
+    "self-memory",
+    "sync",
+    "incremental"
+  ],
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "sync.mjs",
+    "README.md",
+    "LICENSE",
+    "lib/memory-store.js",
+    "lib/memory-facts.js",
+    "lib/memory-search.js",
+    "lib/memory-crypto.js",
+    "lib/memory-vault.js",
+    "lib/memory-sync.js",
+    "lib/memory-segments.js",
+    "lib/memory-env.js",
+    "lib/memory-archive.js",
+    "lib/memory-lock.js"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dsh": ">=0.2.0-rc.2 <0.3.0-0"
+    },
+    "profiles": [
+      "web",
+      "desktop"
+    ]
+  }
+}
