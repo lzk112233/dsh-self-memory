@@ -41,8 +41,11 @@ import {
   readNotice,
   writeNotice,
   clearNotice,
-  readRemoteEnv
+  readRemoteEnv,
+  applyJoinCode,
+  syncPaths
 } from './lib/memory-sync.js'
+import { loadOrCreateKey } from './lib/memory-crypto.js'
 import {
   buildEnv,
   readEnv,
@@ -60,11 +63,28 @@ import {
   archivedSet,
   archiveStats
 } from './lib/memory-archive.js'
+import { sessionsStatus } from './lib/memory-sessions.js'
+
+import {
+  peersPush,
+  peersFetch,
+  sendTask,
+  tasksOf,
+  recordResult,
+  markRunning,
+  runHeadless,
+  peerHint,
+  deviceId,
+  credentialEnv,
+  DEFAULT_PEER_INTERVAL
+} from './lib/memory-peers.js'
 
 export const name = 'dsh-self-memory'
 export const inject = ['systemPrompt', 'tools']
 
-const DEFAULT_ROOT = path.join(os.homedir(), '.dsh', 'self-memory')
+// SM_ROOT 让命令行脚本（sync.mjs / peers.mjs / doctor.mjs）和插件指向同一个数据目录，
+// 也方便在一台机器上跑"多台设备"做测试。
+const DEFAULT_ROOT = process.env.SM_ROOT || path.join(os.homedir(), '.dsh', 'self-memory')
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url))
 const FACTS_KEY = 'global'
 const SELFNOTE_MAX = 12
@@ -140,6 +160,21 @@ export function apply(ctx, config) {
   // profile 目录决定"本机装了什么插件"，也决定自动补装时装到哪个 profile
   const profileDir = expandHome(config?.profileDir) || defaultProfileDir()
 
+  // 手机上往往没有终端可敲命令：把 `sync.mjs bundle` 出来的那一行填进配置的 joinCode，
+  // 插件加载时会自己把 key / token / 远端写到位。已经有远端就什么都不做。
+  if (config?.joinCode) {
+    try {
+      const cur = readSyncConfig(root)
+      const keyFile = path.join(root, '.sync', 'master.key')
+      if (!cur.remote || !fs.existsSync(keyFile)) {
+        const r = applyJoinCode(root, config.joinCode)
+        console.log(`[self-memory] 已套用配置里的导入码：${r.remote}（key 指纹 ${r.keyFingerprint}）`)
+      }
+    } catch (error) {
+      console.warn('[self-memory] 导入码无效:', error?.message ?? error)
+    }
+  }
+
   const store = createStore({ dir: root, maxTextChars: 4000 })
   const recall = createRecall({ dir: store.eventsDir })
   const selfNoteFile = path.join(root, 'self-notes.jsonl')
@@ -207,6 +242,130 @@ export function apply(ctx, config) {
     return rec
   }
 
+  // ── 设备网：谁在线、谁派了活、活干完没有 ─────────────────────
+  // 心跳和轮询都跑在 peers.mjs 子进程里（fetch 最长 15 秒，主线程一秒都不等），
+  // 子进程把结果写成 .sync/peers-snapshot.json，主线程只读文件。
+  const peerSnapshotFile = path.join(root, '.sync', 'peers-snapshot.json')
+  const peerReportedFile = path.join(root, '.sync', 'peers-reported.json')
+
+  function readPeerSnapshot() {
+    try {
+      return JSON.parse(fs.readFileSync(peerSnapshotFile, 'utf8'))
+    } catch {
+      return null
+    }
+  }
+
+  function readReported() {
+    try {
+      return JSON.parse(fs.readFileSync(peerReportedFile, 'utf8')) ?? {}
+    } catch {
+      return {}
+    }
+  }
+
+  function markReported(ids) {
+    if (!ids?.length) return
+    const map = readReported()
+    const now = Date.now()
+    for (const id of ids) map[id] = now
+    try {
+      fs.mkdirSync(path.dirname(peerReportedFile), { recursive: true })
+      fs.writeFileSync(peerReportedFile, JSON.stringify(map), 'utf8')
+    } catch {}
+  }
+
+  const peersEnabled = config?.peers !== false
+  const presenceTtl = Math.max(60, Number(config?.presenceTtlSeconds) || 300)
+  const peerInterval = Math.max(30, Number(config?.peerIntervalSeconds) || DEFAULT_PEER_INTERVAL)
+  const allowRemote = config?.allowRemote !== false
+  const remoteProfile = String(config?.remoteProfile || 'headless')
+  const remoteTimeoutMs = Math.max(60, Number(config?.remoteTimeoutSeconds) || 900) * 1000
+
+  let peerChild = null
+  let execBusy = false
+
+  function runPeersTick() {
+    if (!readSyncConfig(root).remote) return false
+    if (peerChild) return false
+    try {
+      peerChild = spawn(process.execPath, [path.join(PLUGIN_DIR, 'peers.mjs'), 'tick'], {
+        stdio: 'ignore',
+        windowsHide: true,
+        env: { ...process.env, SM_ROOT: root, SM_PRESENCE_TTL: String(presenceTtl) }
+      })
+      peerChild.on('exit', () => {
+        peerChild = null
+        cache.at = 0
+        const snap = readPeerSnapshot()
+        // 收到派给自己的活就干；别人的活不碰
+        if (allowRemote && snap?.inbox?.length) void executeInbox(snap.inbox)
+      })
+      peerChild.on('error', (error) => {
+        peerChild = null
+        console.warn('[self-memory] 设备网心跳子进程失败:', error?.message ?? error)
+      })
+      return true
+    } catch (error) {
+      peersChildFallback(error)
+      return false
+    }
+  }
+
+  function peersChildFallback(error) {
+    console.warn('[self-memory] 起设备网子进程失败:', error?.message ?? error)
+  }
+
+  /** 在目标机器上真跑一次 headless 会话，把输出当结果回传。 */
+  async function executeInbox(list) {
+    if (execBusy || !allowRemote) return []
+    execBusy = true
+    const done = []
+    try {
+      const dshBin = findDshBin()
+      // headless 子进程读不到 GUI 会话里的凭据服务，把 refs 直接当环境变量传下去
+      const extraEnv = credentialEnv(path.join(os.homedir(), '.dsh', '.credentials.yaml'))
+      for (const task of list) {
+        if (!task?.id) continue
+        markRunning(root, task.id)
+        // mode=inbox 的活只投递给我看，不自动执行（怕误跑）
+        if (task.mode === 'inbox') {
+          done.push({ id: task.id, mode: 'inbox', ran: false })
+          continue
+        }
+        console.log(`[self-memory] 远程任务 ${task.id}（来自 ${task.from ?? '?'}）开始执行`)
+        const budget = Math.min(remoteTimeoutMs, (Number(task.timeoutSeconds) || 900) * 1000)
+        const r = await runHeadless(task.task, {
+          dshBin,
+          profile: remoteProfile,
+          timeoutMs: budget,
+          cwd: os.homedir(),
+          extraEnv
+        })
+        recordResult(root, {
+          taskId: task.id,
+          from: task.from,
+          task: task.task,
+          ok: r.ok,
+          exitCode: r.exitCode,
+          out: r.out,
+          err: r.err,
+          startedAt: r.startedAt,
+          finishedAt: r.finishedAt,
+          durationMs: r.durationMs
+        })
+        cache.at = 0
+        done.push({ id: task.id, ok: r.ok, ran: true })
+        console.log(`[self-memory] 远程任务 ${task.id} ${r.ok ? '完成' : '失败'}（${Math.round(r.durationMs / 1000)}s）`)
+      }
+    } catch (error) {
+      console.warn('[self-memory] 执行远程任务失败:', error?.message ?? error)
+    } finally {
+      execBusy = false
+    }
+    return done
+  }
+
   // ── 注入渲染 ─────────────────────────────────────────────────
   let cache = { at: 0, text: '' }
 
@@ -253,6 +412,49 @@ export function apply(ctx, config) {
       }
     } catch (error) {
       console.warn('[self-memory] notice render failed:', error?.message ?? error)
+    }
+
+    // 设备网：谁在线 + 派出去的活回来了没有
+    try {
+      const snap = readPeerSnapshot()
+      if (snap) {
+        const hint = peerHint(snap.peers ?? [])
+        if (hint) blocks.push(hint)
+
+        // 只有"我发出去的"任务结果才需要汇报给我
+        const mine = new Map(tasksOf(root).map((t) => [String(t.id), t]))
+        const reported = readReported()
+        const fresh = (snap.results ?? []).filter(
+          (r) => mine.has(String(r.taskId)) && !reported[String(r.taskId)]
+        )
+        if (fresh.length) {
+          const lines = ['【远程结果】别的设备替你干完的活：']
+          let shown = 0
+          for (const r of fresh.slice(-3)) {
+            const t = mine.get(String(r.taskId))
+            const head = `- 「${String(t?.task ?? '').slice(0, 40)}」${r.ok ? '完成' : '失败'}（${r.by}，${Math.round((Number(r.durationMs) || 0) / 1000)}s）`
+            const body = String(r.out || r.err || '').trim()
+            lines.push(head)
+            if (body) lines.push(`  ${body.split('\n').slice(0, 12).join('\n  ')}`)
+            shown++
+          }
+          if (fresh.length > shown) lines.push(`… 另有 ${fresh.length - shown} 条，用 self_memory_remote action=list 看。`)
+          blocks.push(lines.join('\n'))
+          markReported(fresh.map((r) => String(r.taskId)))
+        }
+
+        // 别人派给我、我还没处理的活（allowRemote=false 时只提示不执行）
+        const waiting = (snap.inbox ?? []).filter((t) => t.mode === 'inbox')
+        if (waiting.length) {
+          blocks.push([
+            `【代办的活】${waiting.length} 件别的设备派过来、等你动手的事：`,
+            ...waiting.slice(0, 5).map((t) => `- ${t.id}（来自 ${t.from}）：${String(t.task).slice(0, 120)}`),
+            '这些不是你自己的事，是想让你做的。做完了用 self_memory_remote action=finish id=<id> 回一句结果。'
+          ].join('\n'))
+        }
+      }
+    } catch (error) {
+      console.warn('[self-memory] 设备网渲染失败:', error?.message ?? error)
     }
 
     const text = blocks.join('\n\n')
@@ -658,6 +860,7 @@ export function apply(ctx, config) {
             return [
               `已推送：新增 ${r.uploaded} 条对话，密文 ${r.bytes} B`,
               `累计 ${r.counts.events} 原文 / ${r.counts.facts} 事实 / ${r.counts.selfNotes} 自我认知`,
+              r.sessions?.uploaded ? `会话本体：上传 ${r.sessions.uploaded} 个（云端共 ${r.sessions.remoteTotal} 个）` : '',
               r.mergedRemote ? '（远端有新内容，已自动合并后再推）' : ''
             ].filter(Boolean).join('\n')
           }
@@ -675,6 +878,8 @@ export function apply(ctx, config) {
           return [
             `合并完成：原文 ${r.before.events} → ${r.after.events} 条（新增 ${r.added}），事实 ${r.after.facts} 条，自我认知 ${r.after.selfNotes} 条`,
             `本次下载 ${r.segments} 个段（云端共 ${r.totalSegments} 个）${r.segments === 0 ? '——已经是最新的，没重复下载' : ''}`,
+            r.sessions ? `会话本体：新增 ${r.sessions.added} 个、更新 ${r.sessions.updated} 个（云端共 ${r.sessions.sessions} 个）` : '',
+            r.sessions?.workspaces && (r.sessions.workspaces.added || r.sessions.workspaces.updated) ? `已把工作区登记回侧栏，重启 DSH 后那些对话就会出现` : '',
             r.migrated ? '（顺手把旧的整包 vault.enc 迁移成增量段了）' : ''
           ].filter(Boolean).join('\n')
         }
@@ -687,7 +892,8 @@ export function apply(ctx, config) {
           `已推送至：${s.upToT ? new Date(s.upToT).toLocaleString() : '从未'}`,
           `最近推送：${s.lastPushAt ? new Date(s.lastPushAt).toLocaleString() : '从未'}`,
           `最近拉取：${s.lastPullAt ? new Date(s.lastPullAt).toLocaleString() : '从未'}`,
-          notice ? `上次失败：${new Date(notice.at).toLocaleString()}（${notice.kind === 'network' ? '网络不通' : '出错'}）${notice.message}` : '上次同步：正常'
+          notice ? `上次失败：${new Date(notice.at).toLocaleString()}（${notice.kind === 'network' ? '网络不通' : '出错'}）${notice.message}` : '上次同步：正常',
+          s.sessions ? `会话本体：本地 ${s.sessions.local} 个（${(s.sessions.localBytes / 1048576).toFixed(1)} MB）/ 云端 ${s.sessions.remote} 个；只在本机 ${s.sessions.onlyLocal}、只在云端 ${s.sessions.onlyRemote}` : ''
         ].filter(Boolean).join('\n')
       } catch (error) {
         const notice = writeNotice(root, { error, phase: `tool-${action}` })
@@ -695,6 +901,58 @@ export function apply(ctx, config) {
         return notice.kind === 'network'
           ? `同步没成功：网络不通（大概率没开代理/VPN）。细节：${notice.message}`
           : `同步失败：${notice.message}`
+      }
+    }
+  })
+
+  // ── 会话本体：另一台机器要能看见"之前的对话"，靠的是这一层 ──
+  registerTool({
+    name: 'self_memory_sessions',
+    description: '查看 / 同步 DSH 的会话本体（sessions/ 目录里的 session.v4.jsonl.zstd）。记忆库只是"我记得的事"，会话本体才是"原来的对话"。action=status 看两边差多少 / push 把本机会话加密推上去 / pull 把云端会话解密写回本地并登记进侧栏（需要重启 DSH 才在界面出现）。',
+    parameters: {
+      action: {
+        type: 'string',
+        required: true,
+        enum: ['status', 'push', 'pull'],
+        description: 'status 比较本地与云端；push 上传变化的会话；pull 还原云端会话'
+      }
+    },
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      const action = String(args?.action ?? 'status')
+      const s = syncPaths(root)
+      if (!fs.existsSync(path.join(s.repoDir, '.git'))) return '同步仓库还没建立：先 self_memory_sync action=init 绑定远端。'
+      try {
+        if (action === 'push') {
+          const r = pushSync(root)
+          if (r.pushed) return `已推送会话 ${r.sessions?.uploaded ?? 0} 个（云端共 ${r.sessions?.remoteTotal ?? '?'} 个）。`
+          if (r.reason === 'no-change') return '会话没有变化，跳过推送。'
+          return `推送未完成：${r.detail ?? r.reason}`
+        }
+        if (action === 'pull') {
+          const r = pullSync(root)
+          if (!r.pulled) return `未拉取：${r.reason}`
+          const x = r.sessions
+          if (!x) return '这次拉取没有会话变化。'
+          return [
+            `会话还原：新增 ${x.added} 个、更新 ${x.updated} 个、本地更新保留 ${x.skipped} 个`,
+            x.missingBlob ? `有 ${x.missingBlob} 个会话在清单里但密文缺失（可能没推成功）` : '',
+            x.workspaces && (x.workspaces.added || x.workspaces.updated) ? `工作区已登记 ${x.workspaces.added + x.workspaces.updated} 个，重启 DSH 后出现在侧栏` : '',
+            x.conflicts?.length ? `有 ${x.conflicts.length} 个会话本地比云端新，没有覆盖` : ''
+          ].filter(Boolean).join('\n')
+        }
+        const key = loadOrCreateKey(s.keyPath)
+        const x = sessionsStatus({ root, repoDir: s.repoDir, key })
+        return [
+          `本地会话：${x.local} 个，${(x.localBytes / 1048576).toFixed(1)} MB，跨 ${x.projects} 个项目`,
+          `云端会话：${x.remote} 个，工作区记录 ${x.workspaces} 条`,
+          `只在本机 ${x.onlyLocal} 个${x.onlyLocal ? '（还没推上去）' : ''}；只在云端 ${x.onlyRemote} 个${x.onlyRemote ? '（还没拉下来）' : ''}`
+        ].join('\n')
+      } catch (error) {
+        const notice = writeNotice(root, { error, phase: `sessions-${action}` })
+        return notice.kind === 'network'
+          ? `会话同步没成功：网络不通（大概率没开代理/VPN）。细节：${notice.message}`
+          : `会话同步失败：${notice.message}`
       }
     }
   })
@@ -783,6 +1041,182 @@ export function apply(ctx, config) {
       for (const sid of s.sids.slice(0, 40)) lines.push(`- ${sid}`)
       if (s.sids.length > 40) lines.push(`… 另有 ${s.sids.length - 40} 个`)
       return lines.join('\n')
+    }
+  })
+
+  // ── 设备网：在线感知 + 远程操作 ───────────────────────────────
+  registerTool({
+    name: 'self_memory_devices',
+    description:
+      '看有哪些设备连着同一份记忆、现在谁在线。设备之间靠加密的云端仓库互报心跳（每 90 秒一次），所以「在线」= 最近一次心跳在有效期内的那几台。action=refresh 会立刻连一次网。',
+    parameters: {
+      action: {
+        type: 'string',
+        enum: ['list', 'refresh'],
+        description: 'list=看最近一次快照（不联网，快）；refresh=立刻连网刷新'
+      }
+    },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const me = deviceId(root)
+      let snap = readPeerSnapshot()
+      if (String(args?.action ?? 'list') === 'refresh' || !snap) {
+        const r = peersFetch(root, { ttlSeconds: presenceTtl })
+        if (r.reason === 'no-remote') return '还没绑定云端仓库——设备之间要靠它当中转，先 node sync.mjs connect 或 init。'
+        snap = { at: Date.now(), peers: r.peers, inbox: r.inbox, results: r.results, offline: r.offline }
+        try {
+          fs.mkdirSync(path.dirname(peerSnapshotFile), { recursive: true })
+          fs.writeFileSync(peerSnapshotFile, JSON.stringify(snap), 'utf8')
+        } catch {}
+      }
+      const peers = snap.peers ?? []
+      const others = peers.filter((p) => !p.self)
+      const lines = [`本机：${me}`]
+      if (snap.offline) lines.push('（这次连不上云端，下面可能是旧数据）')
+      if (!others.length) {
+        lines.push('还没有别的设备连过这个仓库。在另一台机器上装同一个插件、导入同一把 master.key 之后，它会出现在这里。')
+      } else {
+        lines.push(`其他设备 ${others.length} 台：`)
+        for (const p of others) {
+          const age = Math.max(0, Math.round((Number(p.ageMs) || 0) / 1000))
+          const when = age < 90 ? `${age} 秒前` : age < 5400 ? `${Math.round(age / 60)} 分钟前` : `${Math.round(age / 3600)} 小时前`
+          lines.push(`- ${p.device}${p.online ? ' · 在线' : ' · 离线'}（${p.host}，${p.platform}）最后心跳 ${when}`)
+        }
+      }
+      const inbox = snap.inbox ?? []
+      if (inbox.length) lines.push(`待处理的远程任务：${inbox.length} 件（action=inbox 看详情）`)
+      return lines.join('\n')
+    }
+  })
+
+  registerTool({
+    name: 'self_memory_remote',
+    description:
+      '让另一台在线的设备替你干活，并取回结果。任务通过加密仓库中转：目标设备在 90 秒内领走，用 dsh headless 真跑一次完整会话，把输出传回来。适合「让家里那台跑一下测试」「让笔记本查一下日志」这类事。',
+    parameters: {
+      action: {
+        type: 'string',
+        required: true,
+        enum: ['send', 'list', 'result', 'inbox', 'run', 'finish'],
+        description: 'send=派活；list=看自己派出去的；result=取某条结果；inbox=看派给我的；run=立刻执行派给我的；finish=手工回一条结果'
+      },
+      target: { type: 'string', description: 'action=send 时指定目标设备 id，或 * 表示任意一台在线设备' },
+      task: { type: 'string', description: 'action=send 时要对方做的事（会被当成一次完整的用户发言）；action=finish 时是结果内容' },
+      id: { type: 'string', description: 'action=result / run / finish 时的任务 id' },
+      mode: {
+        type: 'string',
+        enum: ['headless', 'inbox'],
+        description: 'headless=对方自动跑（默认）；inbox=只投递到对方收件箱，等它自己决定做不做'
+      },
+      timeoutSeconds: { type: 'integer', description: '对方执行的超时秒数，默认 900' }
+    },
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      const action = String(args?.action ?? 'list')
+
+      if (action === 'send') {
+        const task = String(args?.task ?? '').trim()
+        if (!task) return 'task 不能为空。'
+        let target = String(args?.target ?? '*').trim() || '*'
+        if (target !== '*') {
+          // 允许用主机名简写：解析到真正的 device id
+          const snap = readPeerSnapshot() ?? { peers: peersFetch(root, { ttlSeconds: presenceTtl }).peers ?? [] }
+          const hit = (snap.peers ?? []).find(
+            (p) => !p.self && (p.device === target || p.host?.toLowerCase() === target.toLowerCase())
+          )
+          if (!hit) {
+            const known = (snap.peers ?? []).filter((p) => !p.self).map((p) => p.device)
+            return `找不到目标设备「${target}」。已知设备：${known.join('、') || '(无)'}。也可以用 * 让任意在线设备领。`
+          }
+          target = hit.device
+        }
+        const r = sendTask(root, {
+          to: target,
+          task,
+          mode: args?.mode === 'inbox' ? 'inbox' : 'headless',
+          timeoutSeconds: args?.timeoutSeconds
+        })
+        cache.at = 0
+        return [
+          `已下发：${r.id} → ${r.to}`,
+          `对方 90 秒内会领走；到时候用 self_memory_remote action=result id=${r.id} 取结果，或者直接等我在下一轮提示里看到它。`
+        ].join('\n')
+      }
+
+      if (action === 'list') {
+        const mine = tasksOf(root)
+        if (!mine.length) return '还没有派出去过任务。'
+        const r = peersFetch(root, { ttlSeconds: presenceTtl })
+        const results = new Map((r.results ?? []).map((x) => [String(x.taskId), x]))
+        const lines = [`派出去 ${mine.length} 条：`]
+        for (const t of mine.slice(-10).reverse()) {
+          const hit = results.get(String(t.id))
+          const state = hit ? (hit.ok ? '已完成' : '失败') : '等待中'
+          lines.push(`- ${t.id} → ${t.to} [${state}] ${String(t.task).slice(0, 60)}`)
+        }
+        return lines.join('\n')
+      }
+
+      if (action === 'inbox') {
+        const r = peersFetch(root, { ttlSeconds: presenceTtl })
+        if (r.reason === 'no-remote') return '还没绑定云端仓库。'
+        const list = r.inbox ?? []
+        if (!list.length) return '没有派给我的活。'
+        return [
+          `派给我 ${list.length} 件：`,
+          ...list.map((t) => `- ${t.id}（来自 ${t.from}，${t.mode}）：${String(t.task).slice(0, 160)}`),
+          'action=run 立刻执行，或 action=finish id=<id> task=<结果> 手工回复。'
+        ].join('\n')
+      }
+
+      if (action === 'result') {
+        const id = String(args?.id ?? '').trim()
+        if (!id) return 'id 不能为空。'
+        const r = peersFetch(root, { ttlSeconds: presenceTtl })
+        const hit = (r.results ?? []).find((x) => String(x.taskId) === id)
+        if (!hit) {
+          const mine = tasksOf(root).find((t) => String(t.id) === id)
+          if (!mine) return `没有这个任务：${id}`
+          const secs = Math.round((Date.now() - Number(mine.createdAt)) / 1000)
+          return `还没结果（已等待 ${secs} 秒）。对方在线的话 90 秒内会领走；不在线就得等它开机。`
+        }
+        return [
+          `任务 ${id} ${hit.ok ? '完成' : '失败'}（${hit.by}，${Math.round((Number(hit.durationMs) || 0) / 1000)}s，exit=${hit.exitCode}）`,
+          '',
+          String(hit.out || '').slice(0, 4000) || '(无输出)',
+          hit.err ? `\n[stderr]\n${String(hit.err).slice(0, 1200)}` : ''
+        ].join('\n').trim()
+      }
+
+      if (action === 'run') {
+        if (!allowRemote) return '本机配置里 allowRemote=false，不会执行别的设备派来的活。'
+        const r = peersFetch(root, { ttlSeconds: presenceTtl })
+        const list = (r.inbox ?? []).filter((t) => !args?.id || String(t.id) === String(args.id))
+        if (!list.length) return '没有待执行的远程任务。'
+        const done = await executeInbox(list)
+        return [
+          `执行了 ${done.filter((d) => d.ran).length} 件：`,
+          ...done.map((d) => `- ${d.id} ${d.ran ? (d.ok ? '完成' : '失败') : '只记录未执行（mode=inbox）'}`),
+          '结果已经推回云端，发起方下次轮询就能看到。'
+        ].join('\n')
+      }
+
+      if (action === 'finish') {
+        const id = String(args?.id ?? '').trim()
+        if (!id) return 'id 不能为空。'
+        recordResult(root, {
+          taskId: id,
+          from: 'manual',
+          ok: true,
+          exitCode: 0,
+          out: String(args?.task ?? '').slice(0, 8000),
+          finishedAt: Date.now()
+        })
+        cache.at = 0
+        return `已把 ${id} 的结果推回云端。`
+      }
+
+      return `未知 action：${action}`
     }
   })
 
@@ -886,10 +1320,24 @@ export function apply(ctx, config) {
     if (typeof pullTimer.unref === 'function') pullTimer.unref()
   }
 
+  // ── 设备网：心跳 + 收件轮询（默认 90 秒一次）──
+  // 没有绑定远端就没有"别的设备"这回事，不必空转。
+  let peerTimer = null
+  let peerKickoff = null
+  if (peersEnabled && readSyncConfig(root).remote) {
+    peerKickoff = setTimeout(() => runPeersTick(), 8000)
+    if (typeof peerKickoff.unref === 'function') peerKickoff.unref()
+    peerTimer = setInterval(() => runPeersTick(), peerInterval * 1000)
+    if (typeof peerTimer.unref === 'function') peerTimer.unref()
+  }
+
   ctx.effect(() => () => {
     clearInterval(timer)
     clearInterval(archiveTimer)
     if (syncTimer) clearInterval(syncTimer)
+    if (peerTimer) clearInterval(peerTimer)
+    if (peerKickoff) clearTimeout(peerKickoff)
+    try { peerChild?.kill?.() } catch {}
     try { disposeSection?.dispose?.() } catch {}
     try { disposeEvents?.dispose?.() } catch {}
     for (const dispose of disposers) {

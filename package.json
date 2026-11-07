@@ -1,7 +1,7 @@
 {
   "name": "dsh-self-memory",
-  "version": "1.3.2",
-  "description": "四层记忆 + 自我认知 + 归档联动 + 环境清单同步 for DSH：增量加密同步，换机器后记忆和插件环境一起长回来",
+  "version": "1.5.0",
+  "description": "四层记忆 + 自我认知 + 归档联动 + 环境清单同步 + 会话本体同步 + 多设备在线感知与远程派活 for DSH：增量加密同步，换机器后记忆、对话和插件环境一起长回来",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -29,13 +29,16 @@
     "long-term-memory",
     "self-memory",
     "sync",
-    "incremental"
+    "incremental",
+    "sessions"
   ],
   "files": [
     "index.js",
     "cordis.patch.yml",
     "sync.mjs",
     "verify.mjs",
+    "peers.mjs",
+    "doctor.mjs",
     "README.md",
     "LICENSE",
     "lib/memory-store.js",
@@ -47,7 +50,9 @@
     "lib/memory-segments.js",
     "lib/memory-env.js",
     "lib/memory-archive.js",
-    "lib/memory-lock.js"
+    "lib/memory-lock.js",
+    "lib/memory-peers.js",
+    "lib/memory-sessions.js"
   ],
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",

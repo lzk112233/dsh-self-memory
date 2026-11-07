@@ -6,3 +6,23 @@
         pullOnStart: true
         # 开着 DSH 期间每 30 分钟静默推一次；0 = 只在手动调用 self_memory_sync 时推
         syncIntervalMinutes: 30
+        # 设备网：多台设备互报在线、互相派活。关掉它就是单机版
+        peers: true
+        # 会话本体同步：把 DSH 的 sessions/ 目录一起搬上云。
+        # 关掉它 = 只有"记忆"跨设备，看不到原来的对话（false 时另一台机器只能检索片段）
+        syncSessions: true
+        # 只同步最近 N 天动过的会话，0 = 全部（116 个会话约 31 MB，首次推送会慢一点）
+        sessionsMaxAgeDays: 0
+        # 心跳/轮询间隔（秒）。越小越"实时"，代价是云端仓库的推送频率
+        peerIntervalSeconds: 90
+        # 多久没心跳就算离线（秒）
+        presenceTtlSeconds: 300
+        # 允不允许别的设备在这台机器上派活执行（关掉就只收不发）
+        allowRemote: true
+        # 远程任务用哪个 profile 跑：headless = 一次性会话，跑完就退
+        remoteProfile: 'headless'
+        # 单个远程任务的超时（秒）
+        remoteTimeoutSeconds: 900
+        # 没有终端的设备（手机上的 DSH）：把桌面端 `node sync.mjs bundle` 输出的那一行贴进来，
+        # 插件启动时会自己写 master.key / token / 远端。只在还没绑定时生效，留着也无害。
+        # joinCode: 'SMBJOIN1.eyJ2IjoxLCJyZW1vdGUi...'
